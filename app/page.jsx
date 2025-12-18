@@ -29,6 +29,11 @@ import {
   Github,
   LoaderPinwheel,
   Fan,
+  MessageCircleQuestion,
+  Eraser,
+  Undo2,
+  Trash2,
+  Download
 } from "lucide-react";
 
 // Image manipulations
@@ -40,7 +45,9 @@ import {
   canvasToFloat32Array,
   float32ArrayToCanvas,
   sliceTensor,
-  maskCanvasToFloat32Array
+  maskCanvasToFloat32Array,
+  traceContours,
+  isPointInPolygon
 } from "@/lib/imageutils";
 
 export default function Home() {
@@ -53,6 +60,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [imageEncoded, setImageEncoded] = useState(false);
   const [status, setStatus] = useState("");
+  const [polygons, setPolygons] = useState([]); // Array of { id, polygon, points }
 
   // web worker, image and mask
   const samWorker = useRef(null);
@@ -60,11 +68,24 @@ export default function Home() {
   const [mask, setMask] = useState(null); // canvas
   const [prevMaskArray, setPrevMaskArray] = useState(null); // Float32Array
   const [imageURL, setImageURL] = useState(
-    "https://upload.wikimedia.org/wikipedia/commons/3/38/Flamingos_Laguna_Colorada.jpg"
+    "/AAA1111.webp"
   );
+  const [clickMode, setClickMode] = useState("positive"); // "positive", "negative", "box"
+  const [points, setPoints] = useState([]); // state for React rendering
+  const [boxStart, setBoxStart] = useState(null); // {x, y} for dragging
+  const [hoverBox, setHoverBox] = useState(null); // {x, y, w, h} for visuals
+
   const canvasEl = useRef(null);
   const fileInputEl = useRef(null);
   const pointsRef = useRef([]);
+
+  // Multi-mask candidates
+  const [candidates, setCandidates] = useState([]); // [{mask, score}]
+  const [selectedCandidateIdx, setSelectedCandidateIdx] = useState(0);
+
+  // Segment Everything state
+  const [isSegmentingAll, setIsSegmentingAll] = useState(false);
+  const [segmentAllQueue, setSegmentAllQueue] = useState(0);
 
   const [stats, setStats] = useState(null);
 
@@ -85,21 +106,63 @@ export default function Home() {
 
   // Start decoding, prompt with mouse coords
   const imageClick = (event) => {
-    if (!imageEncoded) return;
+    if (!imageEncoded || clickMode === "box") return;
 
     event.preventDefault();
-    console.log(event.button);
 
     const canvas = canvasEl.current;
     const rect = event.target.getBoundingClientRect();
 
-    // input image will be resized to 1024x1024 -> normalize mouse pos to 1024x1024
+    // Determine label
+    let label = 1;
+    if (event.button === 2) {
+      label = 0; // standard right click behavior
+    } else {
+      label = clickMode === "positive" ? 1 : 0;
+    }
+
     const point = {
       x: ((event.clientX - rect.left) / canvas.width) * imageSize.w,
       y: ((event.clientY - rect.top) / canvas.height) * imageSize.h,
-      label: event.button === 0 ? 1 : 0,
+      label: label,
     };
-    pointsRef.current.push(point);
+
+    // Check if we clicked on a saved polygon ONLY if we don't have an active mask
+    if (points.length === 0 && !mask) {
+      for (let i = 0; i < polygons.length; i++) {
+        const poly = polygons[i];
+        if (isPointInPolygon(point, poly.polygon)) {
+          // Restore this polygon
+          const savedPoints = poly.points;
+
+          // Remove from saved list (move to active)
+          const newPolygons = polygons.filter(p => p.id !== poly.id);
+          setPolygons(newPolygons);
+
+          // Set as active points
+          setPoints(savedPoints);
+          pointsRef.current = savedPoints;
+
+          // Trigger decode
+          samWorker.current.postMessage({
+            type: "decodeMask",
+            data: {
+              points: savedPoints,
+              maskArray: null,
+              maskShape: null,
+            }
+          });
+          setLoading(true);
+          setStatus("Restoring ID " + poly.id);
+          return; // Stop processing this click
+        }
+      }
+    }
+
+    const newPoints = [...points, point];
+    setPoints(newPoints);
+    pointsRef.current = newPoints;
+
 
     // do we have a mask already? ie. a refinement click?
     if (prevMaskArray) {
@@ -108,39 +171,215 @@ export default function Home() {
       samWorker.current.postMessage({
         type: "decodeMask",
         data: {
-          points: pointsRef.current,
+          points: newPoints,
           maskArray: prevMaskArray,
           maskShape: maskShape,
         }
-      });      
+      });
     } else {
       samWorker.current.postMessage({
         type: "decodeMask",
         data: {
-          points: pointsRef.current,
+          points: newPoints,
           maskArray: null,
           maskShape: null,
         }
-      });      
+      });
     }
 
     setLoading(true);
     setStatus("Decoding");
   };
 
+  // Box Interactions
+  const handleMouseDown = (e) => {
+    if (clickMode !== "box" || !imageEncoded) return;
+    const canvas = canvasEl.current;
+    const rect = e.target.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / canvas.width) * imageSize.w;
+    const y = ((e.clientY - rect.top) / canvas.height) * imageSize.h;
+    setBoxStart({ x, y });
+  };
+
+  const handleMouseMove = (e) => {
+    if (!boxStart || clickMode !== "box") return;
+    const canvas = canvasEl.current;
+    const rect = e.target.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / canvas.width) * imageSize.w;
+    const y = ((e.clientY - rect.top) / canvas.height) * imageSize.h;
+    setHoverBox({
+      x: Math.min(boxStart.x, x),
+      y: Math.min(boxStart.y, y),
+      w: Math.abs(x - boxStart.x),
+      h: Math.abs(y - boxStart.y)
+    });
+  };
+
+  const handleMouseUp = (e) => {
+    if (!boxStart || clickMode !== "box") return;
+    const canvas = canvasEl.current;
+    const rect = e.target.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / canvas.width) * imageSize.w;
+    const y = ((e.clientY - rect.top) / canvas.height) * imageSize.h;
+
+    // Finalize
+    const x1 = Math.min(boxStart.x, x);
+    const y1 = Math.min(boxStart.y, y);
+    const x2 = Math.max(boxStart.x, x);
+    const y2 = Math.max(boxStart.y, y);
+
+    setBoxStart(null);
+    setHoverBox(null);
+
+    // Create points for box prompt
+    // Top-left (label 2), Bottom-right (label 3)
+    const newPoints = [
+      { x: x1, y: y1, label: 2 },
+      { x: x2, y: y2, label: 3 }
+    ];
+    setPoints(newPoints);
+    pointsRef.current = newPoints;
+
+    samWorker.current.postMessage({
+      type: "decodeMask",
+      data: {
+        points: newPoints,
+        maskArray: null, // Box prompt doesn't typically mix with previous mask inputs in simple flows
+        maskShape: null,
+      }
+    });
+    setLoading(true);
+    setStatus("Decoding Box");
+  };
+
   // Decoding finished -> parse result and update mask
   const handleDecodingResults = (decodingResults) => {
-    // SAM2 returns 3 mask along with scores -> select best one
+    // SAM2 returns 3 masks along with scores
     const maskTensors = decodingResults.masks;
     const [bs, noMasks, width, height] = maskTensors.dims;
     const maskScores = decodingResults.iou_predictions.cpuData;
-    const bestMaskIdx = maskScores.indexOf(Math.max(...maskScores));
-    const bestMaskArray = sliceTensor(maskTensors, bestMaskIdx)
-    let bestMaskCanvas = float32ArrayToCanvas(bestMaskArray, width, height)
-    bestMaskCanvas = resizeCanvas(bestMaskCanvas, imageSize);
 
-    setMask(bestMaskCanvas);
-    setPrevMaskArray(bestMaskArray);
+    // Store all 3 candidates
+    const newCandidates = [];
+    for (let i = 0; i < 3; i++) {
+      const maskArray = sliceTensor(maskTensors, i);
+      let maskCanvas = float32ArrayToCanvas(maskArray, width, height);
+      maskCanvas = resizeCanvas(maskCanvas, imageSize);
+      newCandidates.push({
+        mask: maskCanvas,
+        score: maskScores[i],
+        maskArray: maskArray
+      });
+    }
+
+    const bestIdx = maskScores.indexOf(Math.max(...maskScores));
+
+    // If segmenting all, we don't update the interactive mask state
+    if (isSegmentingAll) {
+      setSegmentAllQueue(prev => {
+        const left = prev - 1;
+        if (left <= 0) {
+          setIsSegmentingAll(false);
+          setStatus("Ready");
+        }
+        return left;
+      });
+
+      // Use best mask
+      const maskArray = sliceTensor(maskTensors, bestIdx);
+      let maskCanvas = float32ArrayToCanvas(maskArray, width, height);
+      maskCanvas = resizeCanvas(maskCanvas, imageSize); // Resize to 1024x1024
+
+      const ctx = maskCanvas.getContext("2d");
+      const imgData = ctx.getImageData(0, 0, imageSize.w, imageSize.h).data;
+
+      const poly = traceContours(imgData, imageSize.w, imageSize.h);
+
+      if (poly.length > 0) {
+        const newPoly = {
+          id: Math.random().toString(36).substr(2, 9),
+          polygon: poly,
+          points: []
+        };
+        setPolygons(prev => [...prev, newPoly]);
+      }
+      return;
+    }
+
+    setCandidates(newCandidates);
+    setSelectedCandidateIdx(bestIdx);
+
+    // Set the primary mask for display/saving
+    setMask(newCandidates[bestIdx].mask);
+    setPrevMaskArray(newCandidates[bestIdx].maskArray);
+  };
+
+  const handleSegmentAll = () => {
+    if (!imageEncoded) return;
+
+    // Grid configuration
+    const rows = 6;
+    const cols = 6;
+    const stepX = imageSize.w / cols;
+    const stepY = imageSize.h / rows;
+
+    setIsSegmentingAll(true);
+    setSegmentAllQueue(rows * cols);
+    setStatus("Scanning...");
+    setPolygons([]);
+    setMask(null);
+    setPoints([]);
+
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const x = stepX * c + stepX / 2;
+        const y = stepY * r + stepY / 2;
+
+        samWorker.current.postMessage({
+          type: "decodeMask",
+          data: {
+            points: [{ x, y, label: 1 }],
+            maskArray: null,
+            maskShape: null,
+          }
+        });
+      }
+    }
+  };
+
+  // When user switches candidate
+  useEffect(() => {
+    if (candidates.length > 0) {
+      setMask(candidates[selectedCandidateIdx].mask);
+      setPrevMaskArray(candidates[selectedCandidateIdx].maskArray);
+    }
+  }, [selectedCandidateIdx, candidates]);
+
+  const saveAnnotation = () => {
+    if (!mask) return;
+
+    // Get mask data
+    const ctx = mask.getContext("2d");
+    const initData = ctx.getImageData(0, 0, mask.width, mask.height).data;
+
+    // Trace contours
+    const poly = traceContours(initData, mask.width, mask.height);
+
+    // Add to list
+    if (poly.length > 0) {
+      const newPoly = {
+        id: Math.random().toString(36).substr(2, 9),
+        polygon: poly,
+        points: points // Save the inputs that created it
+      };
+      setPolygons([...polygons, newPoly]);
+
+      // Clear current active mask state to "commit" the save
+      setMask(null);
+      setPoints([]);
+      pointsRef.current = [];
+      setPrevMaskArray(null);
+    }
   };
 
   // Handle web worker messages
@@ -188,6 +427,7 @@ export default function Home() {
   // Reset all the image-based state: points, mask, offscreen canvases .. 
   const resetState = () => {
     pointsRef.current = [];
+    setPoints([]);
     setImage(null);
     setMask(null);
     setPrevMaskArray(null);
@@ -268,6 +508,48 @@ export default function Home() {
     }
   }, [imageURL]);
 
+  // Download annotated image
+  const handleDownload = () => {
+    if (!image) return;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const ctx = canvas.getContext("2d");
+
+    // Draw image
+    ctx.drawImage(image, 0, 0);
+
+    // Draw polygons
+    if (polygons.length > 0) {
+      ctx.strokeStyle = "blue";
+      ctx.lineWidth = 3;
+      ctx.fillStyle = "rgba(0, 0, 255, 0.3)";
+
+      polygons.forEach(item => {
+        const poly = item.polygon;
+        if (poly.length < 2) return;
+
+        ctx.beginPath();
+        // Polygons are stored in 1024x1024 space (imageSize), which matches `image`.
+        ctx.moveTo(poly[0].x, poly[0].y);
+        for (let i = 1; i < poly.length; i++) {
+          ctx.lineTo(poly[i].x, poly[i].y);
+        }
+        ctx.closePath();
+        ctx.stroke();
+        ctx.fill();
+      });
+    }
+
+    const link = document.createElement("a");
+    link.download = "annotated-image.png";
+    link.href = canvas.toDataURL();
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   // Offscreen canvas changed, draw it
   useEffect(() => {
     if (image) {
@@ -290,52 +572,108 @@ export default function Home() {
 
   // Mask changed, draw original image and mask on top with some alpha
   useEffect(() => {
-    if (mask) {
+    if (mask || image) {
       const canvas = canvasEl.current;
       const ctx = canvas.getContext("2d");
+      ctx.clearRect(0, 0, canvas.width, canvas.height); // clear first
 
-      ctx.drawImage(
-        image,
-        0,
-        0,
-        image.width,
-        image.height,
-        0,
-        0,
-        canvas.width,
-        canvas.height
-      );
-      ctx.globalAlpha = 0.7;
-      ctx.drawImage(
-        mask,
-        0,
-        0,
-        mask.width,
-        mask.height,
-        0,
-        0,
-        canvas.width,
-        canvas.height
-      );
-      ctx.globalAlpha = 1;
+      if (image) {
+        ctx.drawImage(
+          image,
+          0,
+          0,
+          image.width,
+          image.height,
+          0,
+          0,
+          canvas.width,
+          canvas.height
+        );
+      }
+
+      if (mask) {
+        ctx.globalAlpha = 0.5; // Slightly more transparent for better point visibility
+        ctx.drawImage(
+          mask,
+          0,
+          0,
+          mask.width,
+          mask.height,
+          0,
+          0,
+          canvas.width,
+          canvas.height
+        );
+        ctx.globalAlpha = 1;
+      }
+
+      // Draw saved polygons
+      if (polygons.length > 0) {
+        ctx.strokeStyle = "blue";
+        ctx.lineWidth = 3;
+        ctx.fillStyle = "rgba(0, 0, 255, 0.3)";
+
+        polygons.forEach(item => {
+          const poly = item.polygon;
+          if (poly.length < 2) return;
+
+          ctx.beginPath();
+          // Start
+          const startX = (poly[0].x / imageSize.w) * canvas.width;
+          const startY = (poly[0].y / imageSize.h) * canvas.height;
+          ctx.moveTo(startX, startY);
+
+          for (let i = 1; i < poly.length; i++) {
+            const px = (poly[i].x / imageSize.w) * canvas.width;
+            const py = (poly[i].y / imageSize.h) * canvas.height;
+            ctx.lineTo(px, py);
+          }
+          ctx.closePath();
+          ctx.stroke();
+          ctx.fill();
+        });
+      }
+
+      // Draw points
+      points.forEach((point) => {
+        // Convert back from image coordinates to canvas coordinates
+        const x = (point.x / imageSize.w) * canvas.width;
+        const y = (point.y / imageSize.h) * canvas.height;
+
+        ctx.beginPath();
+        ctx.arc(x, y, 5, 0, 2 * Math.PI);
+        // Box points labels 2 and 3
+        if (point.label === 2 || point.label === 3) {
+          ctx.fillStyle = "#0000ff"; // Blue for box corners
+        } else {
+          ctx.fillStyle = point.label === 1 ? "#00ff00" : "#ff0000";
+        }
+        ctx.fill();
+        ctx.strokeStyle = "white";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      });
+
+      // Draw Box Dragging
+      if (hoverBox) {
+        const x = (hoverBox.x / imageSize.w) * canvas.width;
+        const y = (hoverBox.y / imageSize.h) * canvas.height;
+        const w = (hoverBox.w / imageSize.w) * canvas.width;
+        const h = (hoverBox.h / imageSize.h) * canvas.height;
+
+        ctx.strokeStyle = "purple";
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 5]);
+        ctx.strokeRect(x, y, w, h);
+        ctx.setLineDash([]);
+      }
     }
-  }, [mask, image]);
+  }, [mask, image, points, polygons, hoverBox]);
 
   return (
     <div className="flex items-center justify-center min-h-screen bg-background p-4">
-      <Card className="w-full max-w-2xl">
-        <div className="absolute top-4 right-4">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() =>
-              window.open("https://github.com/geronimi73/next-sam", "_blank")
-            }
-          >
-            <Github className="w-4 h-4 mr-2" />
-            View on GitHub
-          </Button>
-        </div>
+      <Card className="w-full max-w-5xl">
+
         <CardHeader>
           <CardTitle>
             <div className="flex flex-col gap-2">
@@ -369,34 +707,156 @@ export default function Home() {
                   {status}
                 </p>
               </Button>
+
+              {/* Controls */}
+              {imageEncoded && (
+                <div className="flex bg-secondary p-1 rounded-md gap-1">
+                  <Button
+                    variant={clickMode === "positive" ? "default" : "ghost"}
+                    size="sm"
+                    onClick={() => setClickMode("positive")}
+                    className="gap-2"
+                  >
+                    Add Area
+                  </Button>
+                  <Button
+                    variant={clickMode === "negative" ? "destructive" : "ghost"}
+                    size="sm"
+                    onClick={() => setClickMode("negative")}
+                    className="gap-2"
+                  >
+                    Remove Area
+                  </Button>
+                  <Button
+                    variant={clickMode === "box" ? "secondary" : "ghost"}
+                    size="sm"
+                    onClick={() => setClickMode("box")}
+                    className="gap-2"
+                  >
+                    <Crop className="w-4 h-4" /> Box
+                  </Button>
+                  <Button
+                    variant={isSegmentingAll ? "outline" : "ghost"}
+                    size="sm"
+                    disabled={isSegmentingAll}
+                    onClick={handleSegmentAll}
+                    className="gap-2"
+                  >
+                    <LoaderPinwheel className={isSegmentingAll ? "animate-spin w-4 h-4" : "w-4 h-4"} /> All
+                  </Button>
+                </div>
+              )}
+
+              {/* Candidate Toggle */}
+              {candidates.length > 0 && (
+                <div className="flex bg-secondary p-1 rounded-md gap-1 items-center px-2">
+                  <span className="text-xs font-mono mr-2">Mask:</span>
+                  {[0, 1, 2].map(idx => (
+                    <Button
+                      key={idx}
+                      variant={selectedCandidateIdx === idx ? "outline" : "ghost"}
+                      size="icon"
+                      className="w-6 h-6 text-xs"
+                      onClick={() => setSelectedCandidateIdx(idx)}
+                    >
+                      {idx + 1}
+                    </Button>
+                  ))}
+                </div>
+              )}
+              {imageEncoded && (
+                <div className="flex bg-secondary p-1 rounded-md gap-1">
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => {
+                      const newPoints = points.slice(0, -1);
+                      setPoints(newPoints);
+                      pointsRef.current = newPoints;
+                      // Trigger re-decode if we have points left, else define reset logic if needed or just clear mask
+                      // ideally re-run decode with remaining points
+                      if (newPoints.length > 0) {
+                        samWorker.current.postMessage({
+                          type: "decodeMask",
+                          data: {
+                            points: newPoints,
+                            maskArray: null, // Start fresh for simplicity when undoing to avoid confusing history
+                            maskShape: null,
+                          }
+                        });
+                        setLoading(true);
+                        setStatus("Decoding");
+                      } else {
+                        setMask(null);
+                        setPrevMaskArray(null);
+                      }
+                    }}
+                    title="Undo last point"
+                  >
+                    <Undo2 className="w-4 h-4" />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => {
+                      resetState();
+                      setImageEncoded(true); // Keep image encoded
+                      // Need to restore imageURL though - resetState clears a lot.
+                      // Wait, resetState clears image element too?
+                      // Let's make a custom clear points function
+                      setPoints([]);
+                      pointsRef.current = [];
+                      setMask(null);
+                      setPrevMaskArray(null);
+                      setPolygons([]); // clear polygons too? Maybe optional. 
+                      // Let's clear everything for a full reset.
+                    }}
+                    title="Clear all points"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </Button>
+                </div>
+              )}
+
               <div className="flex gap-1">
-                <Button 
-                  onClick={()=>{fileInputEl.current.click()}} 
-                  variant="secondary" 
+                <Button
+                  onClick={() => { fileInputEl.current.click() }}
+                  variant="secondary"
                   disabled={loading}>
-                  <ImageUp/> Upload
+                  <ImageUp /> Upload
                 </Button>
                 <Button
-                    onClick={()=>{setInputDialogOpen(true)}}
-                    variant="secondary"
-                    disabled={loading}
-                  >
-                  <ImageUp/> From URL
+                  onClick={() => { setInputDialogOpen(true) }}
+                  variant="secondary"
+                  disabled={loading}
+                >
+                  <ImageUp /> From URL
                 </Button>
-                <Button 
-                  onClick={cropClick} 
-                  disabled={mask==null}
+                <Button
+                  onClick={cropClick}
+                  disabled={mask == null}
                   variant="secondary">
-                  <ImageDown/> Crop
+                  <ImageDown /> Crop
                 </Button>
+                <Button
+                  onClick={handleDownload}
+                  disabled={!imageEncoded}
+                  variant="secondary">
+                  <Download /> Download
+                </Button>
+
               </div>
             </div>
             <div className="flex justify-center">
               <canvas
                 ref={canvasEl}
-                width={512}
-                height={512}
+                width={800}
+                height={800}
                 onClick={imageClick}
+                onMouseDown={handleMouseDown}
+                onMouseMove={handleMouseMove}
+                onMouseUp={handleMouseUp}
+                onMouseLeave={handleMouseUp}
                 onContextMenu={(event) => {
                   event.preventDefault();
                   imageClick(event);
@@ -414,19 +874,19 @@ export default function Home() {
           </pre>
         </div>
       </Card>
-      <InputDialog 
-        open={inputDialogOpen} 
-        setOpen={setInputDialogOpen} 
+      <InputDialog
+        open={inputDialogOpen}
+        setOpen={setInputDialogOpen}
         submitCallback={handleUrl}
         defaultURL={inputDialogDefaultURL}
-        />
-      <input 
-        ref={fileInputEl} 
-        hidden="True" 
-        accept="image/*" 
-        type='file' 
-        onInput={handleFileUpload} 
-        />
+      />
+      <input
+        ref={fileInputEl}
+        hidden="True"
+        accept="image/*"
+        type='file'
+        onInput={handleFileUpload}
+      />
       <Analytics />
     </div>
   );
